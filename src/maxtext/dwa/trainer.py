@@ -49,25 +49,79 @@ def cross_entropy(logits: jax.Array, targets: jax.Array) -> jax.Array:
     ).mean()
 
 
+def _build_schedule(name: str, peak: float, min_lr: float, warmup: int, max_steps: int) -> optax.Schedule:
+    """Build an optax LR schedule by name."""
+    decay_steps = max(1, max_steps - warmup)
+
+    if name == "cosine":
+        return optax.warmup_cosine_decay_schedule(
+            init_value=0.0, peak_value=peak,
+            warmup_steps=warmup, decay_steps=max_steps, end_value=min_lr,
+        )
+    if name == "linear":
+        return optax.join_schedules([
+            optax.linear_schedule(0.0, peak, warmup),
+            optax.linear_schedule(peak, min_lr, decay_steps),
+        ], boundaries=[warmup])
+    if name == "constant_with_warmup":
+        return optax.join_schedules([
+            optax.linear_schedule(0.0, peak, warmup),
+            optax.constant_schedule(peak),
+        ], boundaries=[warmup])
+    if name == "polynomial":
+        return optax.join_schedules([
+            optax.linear_schedule(0.0, peak, warmup),
+            optax.polynomial_schedule(
+                init_value=peak, end_value=min_lr,
+                power=1.0, transition_steps=decay_steps,
+            ),
+        ], boundaries=[warmup])
+    if name == "inverse_sqrt":
+        _peak, _min = float(peak), float(min_lr)
+        def _inv_sqrt(step):
+            return jnp.maximum(
+                jnp.array(_min, dtype=jnp.float32),
+                jnp.array(_peak, dtype=jnp.float32) / jnp.sqrt(jnp.array(step, dtype=jnp.float32) + 1.0),
+            )
+        return optax.join_schedules([
+            optax.linear_schedule(0.0, peak, warmup),
+            _inv_sqrt,
+        ], boundaries=[warmup])
+    if name == "cosine_with_restarts":
+        cycle = max(1, decay_steps // 3)
+        cycles = [
+            {"init_value": min_lr, "peak_value": peak * (0.8 ** i),
+             "decay_steps": cycle, "warmup_steps": max(1, cycle // 10), "end_value": min_lr}
+            for i in range(3)
+        ]
+        return optax.join_schedules([
+            optax.linear_schedule(0.0, peak, warmup),
+            optax.sgdr_schedule(cycles),
+        ], boundaries=[warmup])
+    # Unknown name — fall back to cosine
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0, peak_value=peak,
+        warmup_steps=warmup, decay_steps=max_steps, end_value=min_lr,
+    )
+
+
 def make_optimizer(model: nnx.Module, cfg: DWATrainConfig) -> nnx.Optimizer:
-    min_lr = cfg.lr * cfg.lr_min_ratio
-    if cfg.lr_scheduler == "cosine":
-        schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0, peak_value=cfg.lr,
-            warmup_steps=min(cfg.warmup_steps, max(1, cfg.max_steps - 1)),
-            decay_steps=cfg.max_steps, end_value=min_lr,
-        )
-    else:
-        schedule = optax.warmup_exponential_decay_schedule(
-            init_value=0.0, peak_value=cfg.lr,
-            warmup_steps=cfg.warmup_steps,
-            transition_steps=cfg.max_steps, decay_rate=0.5,
-            end_value=min_lr,
-        )
-    tx = optax.chain(
+    G = max(1, cfg.grad_accum_steps)
+    # Scale step counts so the LR schedule spans the right number of optimizer updates.
+    opt_steps = max(1, cfg.max_steps // G)
+    opt_warmup = max(1, cfg.warmup_steps // G)
+    schedule = _build_schedule(
+        name=cfg.lr_scheduler,
+        peak=cfg.lr,
+        min_lr=cfg.lr * cfg.lr_min_ratio,
+        warmup=opt_warmup,
+        max_steps=opt_steps,
+    )
+    base_tx = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip),
         optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay),
     )
+    tx = optax.MultiSteps(base_tx, every_k_schedule=G) if G > 1 else base_tx
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 
@@ -158,6 +212,40 @@ class DWAModelAdapter:
     def _sync_from_model(self):
         _, self._state = nnx.split(self.model)
         _, self._opt_state = nnx.split(self.opt)
+
+    def generate(
+        self,
+        prompt_ids: list,
+        max_new_tokens: Optional[int] = None,
+        temperature: float = 0.7,
+        rng_seed: Optional[int] = None,
+    ) -> list:
+        """Autoregressive generation for all prompts. Returns full sequences (prompt + generated)."""
+        import time
+        if max_new_tokens is None:
+            max_new_tokens = self.cfg.generate_length
+        top_k = self.cfg.generate_top_k
+        seq_len = self.cfg.seq_len
+
+        cache_key = (max_new_tokens, top_k)
+        if not hasattr(self, "_gen_cache_key") or self._gen_cache_key != cache_key:
+            self._generate_fn = _make_generate_loop(self._graph, max_new_tokens, seq_len, top_k)
+            self._gen_cache_key = cache_key
+
+        seed = rng_seed if rng_seed is not None else int(time.time() * 1000) % 1_000_000
+        rng = jax.random.PRNGKey(seed)
+        temp_arr = jnp.array(temperature, dtype=jnp.float32)
+
+        results = []
+        for ids in prompt_ids:
+            ctx = list(ids)[-seq_len:]
+            x = jnp.array(ctx, dtype=jnp.int32)[None]  # [1, T]
+            rng, subrng = jax.random.split(rng)
+            out = self._generate_fn(self._state, x, temp_arr, subrng)
+            jax.block_until_ready(out)
+            results.append(ctx + np.array(out[0]).tolist())
+
+        return results
 
     def save_extra_state(self) -> Dict[str, Any]:
         self._sync_to_model()
@@ -320,6 +408,63 @@ def _make_eval_step(graph):
     return _eval_step
 
 
+def _make_generate_loop(graph, max_length: int, seq_len: int, top_k: int):
+    """JIT-compiled autoregressive generation via fori_loop (XLA-static shapes).
+
+    max_length, seq_len, top_k are closure constants so XLA never retraces
+    when those values stay the same across calls.
+    """
+    @jax.jit
+    def _generate_loop(state, init_ids, temperature, rng):
+        B = init_ids.shape[0]
+        init_len = init_ids.shape[1]
+
+        model = nnx.merge(graph, state)
+        logits_prompt, *_ = model(init_ids, jnp.array(10.0), jnp.array(1.0), deterministic=True)
+        next_logits = logits_prompt[:, -1, :]  # [B, V] — prediction after last prompt token
+
+        buf_len = max(init_len + max_length, seq_len)
+        buffer = jnp.zeros((B, buf_len), dtype=jnp.int32)
+        buffer = buffer.at[:, :init_len].set(init_ids)
+
+        def body_fn(i, carry):
+            buf, logits, step_rng = carry
+            step_rng, sample_rng = jax.random.split(step_rng)
+
+            scaled = logits / jnp.maximum(temperature, jnp.array(1e-5))
+            if top_k > 0:
+                top_k_vals, _ = jax.lax.top_k(scaled, top_k)
+                scaled = jnp.where(scaled < top_k_vals[:, -1:], jnp.array(-1e9), scaled)
+
+            next_token = jax.lax.cond(
+                temperature > 0,
+                lambda rng, lgts: jax.random.categorical(rng, lgts),
+                lambda rng, lgts: jnp.argmax(lgts, axis=-1),
+                sample_rng, scaled,
+            )
+
+            write_pos = init_len + i
+            buf = buf.at[:, write_pos].set(next_token)
+
+            cur_len = init_len + i + 1
+            context = jax.lax.dynamic_slice(
+                buf,
+                (0, jnp.maximum(0, cur_len - seq_len)),
+                (B, seq_len),
+            )
+            m = nnx.merge(graph, state)
+            new_logits, *_ = m(context, jnp.array(10.0), jnp.array(1.0), deterministic=True)
+            pos = jnp.minimum(cur_len, seq_len) - 1
+            new_logits = new_logits[:, pos, :]
+
+            return buf, new_logits, step_rng
+
+        final_buffer, _, _ = jax.lax.fori_loop(0, max_length, body_fn, (buffer, next_logits, rng))
+        return final_buffer[:, init_len:init_len + max_length]
+
+    return _generate_loop
+
+
 class DWATrainer:
     def __init__(self, adapter: DWAModelAdapter, cfg: DWATrainConfig,
                  tokenizer=None, ckpt_dir: str = "checkpoints/dwa", log_dir: str = "logs/dwa"):
@@ -399,8 +544,12 @@ class DWATrainer:
 
                 do_log = (self.step // self.cfg.log_every) > (old_step // self.cfg.log_every)
                 do_eval = (self.step // self.cfg.eval_every) > (old_step // self.cfg.eval_every)
+                do_gen = (
+                    self.cfg.generate_every > 0
+                    and (self.step // self.cfg.generate_every) > (old_step // self.cfg.generate_every)
+                )
 
-                if do_log or do_eval:
+                if do_log or do_eval or do_gen:
                     elapsed = time.perf_counter() - t0
                     val_loss = None
                     if do_eval and val_dataset is not None:
@@ -423,6 +572,10 @@ class DWATrainer:
 
                     if do_eval and self.step > 0 and self.is_main:
                         self.save()
+
+                    if do_gen and self.is_main:
+                        self._run_generation()
+
                     t0 = time.perf_counter()
         finally:
             prefetcher.stop()
@@ -444,6 +597,24 @@ class DWATrainer:
         finally:
             prefetcher.stop()
         return total_loss / max(1, steps)
+
+    def _run_generation(self):
+        if not self.tokenizer:
+            return
+        print(f"\n[DWA] Generation @ step {self.step}")
+        for prompt in self.cfg.generate_prompts:
+            try:
+                ids = self.tokenizer.encode(prompt)
+            except Exception:
+                continue
+            generated = self.adapter.generate([ids])
+            full_ids = generated[0]
+            try:
+                text = self.tokenizer.decode(full_ids)
+            except Exception:
+                text = repr(full_ids)
+            print(f"  Prompt: {prompt!r}")
+            print(f"  Output: {text!r}\n")
 
     def save(self):
         if not self.is_main:
@@ -627,8 +798,12 @@ class MaxTextDWATrainer:
 
             do_log = (self.step // self.cfg.log_every) > (old_step // self.cfg.log_every)
             do_eval = (self.step // self.cfg.eval_every) > (old_step // self.cfg.eval_every)
+            do_gen = (
+                self.cfg.generate_every > 0
+                and (self.step // self.cfg.generate_every) > (old_step // self.cfg.generate_every)
+            )
 
-            if do_log or do_eval:
+            if do_log or do_eval or do_gen:
                 elapsed = time.perf_counter() - t0
                 if do_log and self.is_main:
                     loss_val = float(loss)
@@ -643,7 +818,30 @@ class MaxTextDWATrainer:
 
                 if do_eval and self.step > 0:
                     self.save()
+
+                if do_gen and self.is_main:
+                    self._run_generation()
+
                 t0 = time.perf_counter()
+
+    def _run_generation(self):
+        if not self.tokenizer:
+            return
+        from maxtext.utils import max_logging
+        max_logging.log(f"[DWA] Generation @ step {self.step}")
+        for prompt in self.cfg.generate_prompts:
+            try:
+                ids = self.tokenizer.encode(prompt)
+            except Exception:
+                continue
+            generated = self.adapter.generate([ids])
+            full_ids = generated[0]
+            try:
+                text = self.tokenizer.decode(full_ids)
+            except Exception:
+                text = repr(full_ids)
+            max_logging.log(f"  Prompt: {prompt!r}")
+            max_logging.log(f"  Output: {text!r}")
 
     def evaluate(self, eval_iterator, eval_steps: int = 50) -> float:
         total_loss = 0.0

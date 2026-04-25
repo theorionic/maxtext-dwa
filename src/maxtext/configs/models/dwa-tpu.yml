@@ -61,6 +61,8 @@ pool_eps: 1.0e-8
 tokenizer_name: "gpt2"
 generate_every: 1000
 generate_length: 100
+generate_top_k: 50
+grad_accum_steps: 1
 generate_prompts:
   - "The universe expanded slowly, stretching the fabric of"
   - "Artificial intelligence fundamentally changed how humanity"

@@ -142,10 +142,13 @@ class DWATrainConfig:
     generate_every: int = 500
     generate_length: int = 50
     generate_prompts: Tuple = ("Once upon a time",)
+    generate_top_k: int = 50
     # Datasets
     datasets: Optional[list] = None
     # Inner loop steps per JIT dispatch
     train_steps: int = 16
+    # Gradient accumulation (optimizer updates every N gradient steps)
+    grad_accum_steps: int = 1
 
     def __post_init__(self) -> None:
         required = self.d_model * self.r + self.r * self.d_model + self.d_model
@@ -263,6 +266,8 @@ class DWATrainConfig:
             kwargs["grad_clip"] = config.gradient_clipping_threshold
         if hasattr(config, "steps"):
             kwargs["max_steps"] = config.steps
+        if hasattr(config, "gradient_accumulation_steps"):
+            kwargs["grad_accum_steps"] = config.gradient_accumulation_steps
 
         # GQA / attention config
         if hasattr(config, "base_num_kv_heads"):
