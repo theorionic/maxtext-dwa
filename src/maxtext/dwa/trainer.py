@@ -492,3 +492,207 @@ class DWATrainer:
             with open(ds_path, "rb") as f:
                 self.dataset.load_state_dict(pickle.load(f))
         print(f"[DWA] Resumed from step {self.step}")
+
+
+class MaxTextDWAModelAdapter(DWAModelAdapter):
+    def __init__(
+        self,
+        cfg: DWATrainConfig,
+        rngs: nnx.Rngs,
+        mt_config,
+        mesh,
+        mesh_shape: str | None = None,
+    ):
+        from maxtext.dwa.sharding import setup_from_maxtext
+        mesh = setup_from_maxtext(mt_config, mesh)
+        self.cfg = cfg
+        self.mt_config = mt_config
+        self.model = to_bf16(replicate(DWALanguageModel(cfg, rngs, mt_config=mt_config, mesh=mesh)))
+
+        from maxtext.utils.maxtext_utils import create_learning_rate_schedule
+        from maxtext.optimizers.optimizers import get_optimizer
+        self.lr_schedule = create_learning_rate_schedule(mt_config)
+        tx = get_optimizer(mt_config, self.lr_schedule)
+        self.opt = replicate(nnx.Optimizer(self.model, tx, wrt=nnx.Param))
+
+        self._repl = js.NamedSharding(mesh, js.PartitionSpec())
+        self.alpha_ema = jax.device_put(jnp.ones(cfg.N) / cfg.N, self._repl)
+
+        N, D = cfg.N, cfg.D
+        pool_opt_name = cfg.pool_optimizer
+        if pool_opt_name == "sparse_adafactor":
+            self._pool_opt = (
+                jax.device_put(jnp.zeros(N, dtype=jnp.float32), self._repl),
+                jax.device_put(jnp.zeros(D, dtype=jnp.float32), self._repl),
+                jax.device_put(jnp.zeros(N, dtype=jnp.int32), self._repl),
+            )
+        else:
+            self._pool_opt = (
+                jax.device_put(jnp.zeros((N, D), dtype=jnp.float32), self._repl),
+                jax.device_put(jnp.zeros((N, D), dtype=jnp.float32), self._repl),
+                jax.device_put(jnp.zeros(N, dtype=jnp.int32), self._repl),
+            )
+
+        self._graph, self._state = nnx.split(self.model)
+        self._opt_graph, self._opt_state = nnx.split(self.opt)
+        dwa_cfg = cfg.to_dwa_config()
+        self._train_fn = _make_train_step(self._graph, self._opt_graph, dwa_cfg, cfg)
+        self._eval_fn = _make_eval_step(self._graph)
+        self._pool_update_fn = _make_pool_update(self._graph, cfg)
+
+
+class MaxTextDWATrainer:
+    def __init__(
+        self,
+        adapter: MaxTextDWAModelAdapter,
+        cfg: DWATrainConfig,
+        mt_config,
+        mesh,
+        tokenizer=None,
+        ckpt_dir: str = "checkpoints/dwa",
+    ):
+        from maxtext.common.checkpointing import create_orbax_checkpoint_manager
+
+        self.adapter = adapter
+        self.cfg = cfg
+        self.mt_config = mt_config
+        self.mesh = mesh
+        self.tokenizer = tokenizer
+        self.ckpt_dir = ckpt_dir
+        self.step = 0
+        self.is_main = is_main_process()
+
+        self.checkpoint_manager = create_orbax_checkpoint_manager(
+            checkpoint_dir=ckpt_dir,
+            enable_checkpointing=True,
+            use_async=True,
+            save_interval_steps=cfg.eval_every,
+        )
+
+    def train(self, data_iterator, val_data_iterator=None):
+        from maxtext.common.data_loader import DataLoader
+        from maxtext.utils import max_logging
+
+        max_steps = self.cfg.max_steps
+        train_steps_per_exec = self.cfg.train_steps
+
+        dyn_params = {
+            "beta_util": float(self.cfg.beta_util),
+            "lambda_util": float(self.cfg.lambda_util),
+            "lambda_div": float(self.cfg.lambda_div),
+            "lambda_norm": float(self.cfg.lambda_norm),
+            "lambda_sparse": float(self.cfg.lambda_sparse),
+            "lambda_entropy": float(self.cfg.lambda_entropy),
+            "lambda_sharp_init": float(self.cfg.lambda_sharp_init),
+            "lambda_sharp_final": float(self.cfg.lambda_sharp_final),
+            "temperature": float(self.cfg.T_temperature),
+        }
+
+        t0 = time.perf_counter()
+        first_step = True
+        prev_loss = None
+
+        while self.step < max_steps:
+            xs_list, ys_list = [], []
+            for _ in range(train_steps_per_exec):
+                try:
+                    if isinstance(data_iterator, DataLoader):
+                        batch = data_iterator.load_next_batch()
+                        x, y = batch["inputs"], batch["targets"]
+                    else:
+                        x, y = next(data_iterator)
+                    xs_list.append(x)
+                    ys_list.append(y)
+                except StopIteration:
+                    break
+
+            if not xs_list:
+                break
+
+            x_batch = jnp.stack(xs_list)
+            y_batch = jnp.stack(ys_list)
+
+            if first_step:
+                max_logging.log(f"[DWA] First chunk: x={x_batch.shape}, y={y_batch.shape}. JIT compiling...")
+
+            loss, metrics = self.adapter.train_step(x_batch, y_batch, self.step, dyn_params)
+
+            if first_step:
+                max_logging.log(f"[DWA] First step done in {time.perf_counter() - t0:.1f}s")
+                first_step = False
+
+            steps_computed = x_batch.shape[0]
+            old_step = self.step
+            self.step += steps_computed
+
+            do_log = (self.step // self.cfg.log_every) > (old_step // self.cfg.log_every)
+            do_eval = (self.step // self.cfg.eval_every) > (old_step // self.cfg.eval_every)
+
+            if do_log or do_eval:
+                elapsed = time.perf_counter() - t0
+                if do_log and self.is_main:
+                    loss_val = float(loss)
+                    max_logging.log(
+                        f"step {self.step:>6,}  loss={loss_val:.4f}  "
+                        f"ce={float(metrics.get('ce', 0)):.4f}  "
+                        f"aux={float(metrics.get('aux', 0)):.4f}  "
+                        f"λ={float(metrics.get('lambda', 0)):.2f}  "
+                        f"{elapsed:.1f}s"
+                    )
+                    prev_loss = loss_val
+
+                if do_eval and self.step > 0:
+                    self.save()
+                t0 = time.perf_counter()
+
+    def evaluate(self, eval_iterator, eval_steps: int = 50) -> float:
+        total_loss = 0.0
+        steps = 0
+        for _ in range(eval_steps):
+            try:
+                if isinstance(eval_iterator, DataLoader):
+                    batch = eval_iterator.load_next_batch()
+                    x, y = batch["inputs"], batch["targets"]
+                else:
+                    x, y = next(eval_iterator)
+            except StopIteration:
+                break
+            loss = self.adapter.eval_step(x, y)
+            total_loss += float(loss)
+            steps += 1
+        return total_loss / max(1, steps)
+
+    def save(self):
+        if not self.is_main:
+            return
+        self.adapter._sync_to_model()
+        extra = self.adapter.save_extra_state()
+        import orbax.checkpoint as ocp
+        _, m_state = nnx.split(self.adapter.model)
+        _, o_state = nnx.split(self.adapter.opt)
+        save_args = ocp.args.StandardSave({
+            "model": m_state, "optimizer": o_state,
+            "step": self.step, "extra": extra,
+        })
+        if self.checkpoint_manager is not None:
+            self.checkpoint_manager.save(self.step, args=save_args)
+            self.checkpoint_manager.wait_until_finished()
+
+    def resume(self):
+        import orbax.checkpoint as ocp
+        if self.checkpoint_manager is None:
+            return
+        step = self.checkpoint_manager.latest_step()
+        if step is None:
+            return
+        _, m_state = nnx.split(self.adapter.model)
+        _, o_state = nnx.split(self.adapter.opt)
+        abstract = {"model": m_state, "optimizer": o_state, "step": 0, "extra": {}}
+        restored = self.checkpoint_manager.restore(step, args=ocp.args.StandardRestore(abstract))
+        nnx.update(self.adapter.model, restored["model"])
+        nnx.update(self.adapter.opt, restored["optimizer"])
+        self.step = int(restored.get("step", step))
+        if restored.get("extra"):
+            self.adapter.load_extra_state(restored["extra"])
+        from maxtext.utils import max_logging
+        max_logging.log(f"[DWA] Resumed from step {self.step}")

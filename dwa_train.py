@@ -29,15 +29,7 @@ from maxtext.dwa.data import StreamingDataset, get_tokenizer
 from maxtext.dwa.sharding import is_main_process
 
 
-def main():
-    jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/jax_cache"))
-    parser = argparse.ArgumentParser(description="DWA Training via MaxText")
-    parser.add_argument("--config", type=str, required=True, help="Path to DWA YAML config")
-    parser.add_argument("--mesh", type=str, default=None, help="Device mesh: 'data' or 'data,fsdp'")
-    parser.add_argument("--ckpt-dir", type=str, default="checkpoints/dwa")
-    parser.add_argument("--log-dir", type=str, default="logs/dwa_run")
-    args = parser.parse_args()
-
+def main_standalone(args):
     cfg = DWATrainConfig.from_yaml(args.config)
 
     if is_main_process():
@@ -78,6 +70,61 @@ def main():
 
     if is_main_process():
         print("[DWA] Training finished.")
+
+
+def main_maxtext(args):
+    from maxtext.configs import pyconfig
+    from maxtext.utils import maxtext_utils
+    from maxtext.utils import max_logging
+    from maxtext.dwa.config import DWATrainConfig
+    from maxtext.dwa.trainer import MaxTextDWAModelAdapter, MaxTextDWATrainer
+    from maxtext.dwa.sharding import setup_from_maxtext
+
+    mt_config = pyconfig.initialize([None, args.maxtext_config])
+    dwa_cfg = DWATrainConfig.from_maxtext_config(mt_config)
+
+    if jax.process_index() == 0:
+        params = dwa_cfg.count_params()
+        max_logging.log(
+            f"[DWA] Devices: {jax.device_count()}x {jax.devices()[0].device_kind}\n"
+            f"[DWA] Config: d_model={dwa_cfg.d_model} layers={dwa_cfg.n_layers_A}+{dwa_cfg.n_layers_B} "
+            f"pool={dwa_cfg.N}x{dwa_cfg.D} batch={dwa_cfg.batch_size} seq={dwa_cfg.seq_len}\n"
+            f"[DWA] Total params: {params['total']:,}  pool: {params['pool']:,} ({params['pool_ratio']*100:.1f}%)"
+        )
+
+    mesh = maxtext_utils.get_mesh_from_config(mt_config)
+
+    rngs = nnx.Rngs(params=jax.random.key(42), dropout=jax.random.key(7))
+    adapter = MaxTextDWAModelAdapter(dwa_cfg, rngs, mt_config, mesh, mesh_shape=args.mesh)
+
+    from maxtext.dwa.data import MaxTextDataIterator
+    data_iter = MaxTextDataIterator(mt_config, mesh)
+
+    trainer = MaxTextDWATrainer(
+        adapter, dwa_cfg, mt_config, mesh,
+        ckpt_dir=args.ckpt_dir,
+    )
+    trainer.resume()
+    max_logging.log("[DWA] Starting training with MaxText pipeline...")
+    trainer.train(data_iter)
+
+
+def main():
+    jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/jax_cache"))
+    parser = argparse.ArgumentParser(description="DWA Training via MaxText")
+    parser.add_argument("--config", type=str, default=None, help="Path to standalone DWA YAML config")
+    parser.add_argument("--maxtext-config", type=str, default=None, help="Path to MaxText pyconfig YAML")
+    parser.add_argument("--mesh", type=str, default=None, help="Device mesh: 'data' or 'data,fsdp'")
+    parser.add_argument("--ckpt-dir", type=str, default="checkpoints/dwa")
+    parser.add_argument("--log-dir", type=str, default="logs/dwa_run")
+    args = parser.parse_args()
+
+    if args.maxtext_config:
+        main_maxtext(args)
+    elif args.config:
+        main_standalone(args)
+    else:
+        parser.error("Either --config (standalone) or --maxtext-config must be provided")
 
 
 if __name__ == "__main__":
