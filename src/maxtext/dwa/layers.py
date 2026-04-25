@@ -23,6 +23,12 @@ import jax.numpy as jnp
 import flax.nnx as nnx
 
 from maxtext.dwa.config import DWAConfig
+try:
+    from maxtext.layers.normalizations import RMSNorm as MaxTextRMSNorm
+    _HAS_MAXTEXT_RMSNORM = True
+except ImportError:
+    MaxTextRMSNorm = None
+    _HAS_MAXTEXT_RMSNORM = False
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +169,7 @@ class DWAMiddleLayer(nnx.Module):
         )
         self.b_base = nnx.Param(jnp.zeros(cfg.d_model))
         self.gamma = nnx.Param(jnp.array(cfg.gamma_init))
-        self.layer_norm = nnx.LayerNorm(cfg.d_model, rngs=rngs)
+        self.layer_norm = (MaxTextRMSNorm if _HAS_MAXTEXT_RMSNORM else nnx.LayerNorm)(cfg.d_model, rngs=rngs)
 
     def __call__(
         self,
@@ -350,7 +356,7 @@ class TransformerBlock(nnx.Module):
         window_size: int = 0,
         rngs: nnx.Rngs = None,  # type: ignore[assignment]
     ) -> None:
-        self.ln1 = nnx.LayerNorm(d_model, rngs=rngs)
+        self.ln1 = (MaxTextRMSNorm if _HAS_MAXTEXT_RMSNORM else nnx.LayerNorm)(d_model, rngs=rngs)
         self.attn = CausalSelfAttention(
             d_model, n_heads,
             dropout_rate=dropout_rate,
@@ -360,7 +366,7 @@ class TransformerBlock(nnx.Module):
             window_size=window_size,
             rngs=rngs,
         )
-        self.ln2 = nnx.LayerNorm(d_model, rngs=rngs)
+        self.ln2 = (MaxTextRMSNorm if _HAS_MAXTEXT_RMSNORM else nnx.LayerNorm)(d_model, rngs=rngs)
         self.ffn = FeedForward(d_model, dropout_rate=dropout_rate, rngs=rngs)
 
     def __call__(

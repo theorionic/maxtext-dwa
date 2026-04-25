@@ -18,6 +18,7 @@ from typing import Tuple, Optional
 import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
+from jax.sharding import Mesh
 
 from maxtext.dwa.config import DWATrainConfig, DWAConfig
 from maxtext.dwa.layers import (
@@ -26,17 +27,48 @@ from maxtext.dwa.layers import (
     DWAMiddleLayer,
     TransformerBlock,
     _precompute_rope,
+    _HAS_MAXTEXT_RMSNORM,
 )
+
+try:
+    from maxtext.layers.embeddings import Embed as MaxTextEmbed
+    _HAS_MAXTEXT_EMBED = True
+except ImportError:
+    MaxTextEmbed = None
+    _HAS_MAXTEXT_EMBED = False
+
+try:
+    from maxtext.layers.normalizations import RMSNorm as MaxTextRMSNorm
+    _HAS_MAXTEXT_RMSNORM_MODEL = True
+except ImportError:
+    MaxTextRMSNorm = None
+    _HAS_MAXTEXT_RMSNORM_MODEL = False
+
+_NormLayer = MaxTextRMSNorm if (_HAS_MAXTEXT_RMSNORM or _HAS_MAXTEXT_RMSNORM_MODEL) else nnx.LayerNorm
 
 
 class DWALanguageModel(nnx.Module):
-    def __init__(self, cfg: DWATrainConfig, rngs: nnx.Rngs) -> None:
+    def __init__(
+        self,
+        cfg: DWATrainConfig,
+        rngs: nnx.Rngs,
+        mt_config=None,
+        mesh: Mesh = None,
+    ) -> None:
         self.cfg = cfg
+        self._use_mt_embed = mt_config is not None and mesh is not None
+        self._use_tied_head = self._use_mt_embed
         dwa = cfg.to_dwa_config()
         if "dropout" not in rngs:
             rngs = nnx.Rngs(params=rngs.params(), dropout=rngs.params())
 
-        self.tok_emb = nnx.Embed(cfg.vocab_size, cfg.d_model, rngs=rngs)
+        if self._use_mt_embed:
+            self.tok_emb = MaxTextEmbed(
+                cfg.vocab_size, cfg.d_model, mt_config, mesh, rngs=rngs,
+            )
+        else:
+            self.tok_emb = nnx.Embed(cfg.vocab_size, cfg.d_model, rngs=rngs)
+
         self.use_rope = cfg.use_rope
         if not cfg.use_rope:
             self.pos_emb = nnx.Param(
@@ -51,7 +83,7 @@ class DWALanguageModel(nnx.Module):
                 rngs=rngs,
             ) for _ in range(cfg.n_layers_A)
         ])
-        self.ln_mid = nnx.LayerNorm(cfg.d_model, rngs=rngs)
+        self.ln_mid = _NormLayer(cfg.d_model, rngs=rngs)
         self.pool = VectorPool(dwa, rngs)
         self.retrieval = MultiAspectRetrieval(dwa, rngs)
         self.middle = DWAMiddleLayer(dwa, rngs)
@@ -63,8 +95,9 @@ class DWALanguageModel(nnx.Module):
                 rngs=rngs,
             ) for _ in range(cfg.n_layers_B)
         ])
-        self.ln_f = nnx.LayerNorm(cfg.d_model, rngs=rngs)
-        self.head = nnx.Linear(cfg.d_model, cfg.vocab_size, use_bias=False, rngs=rngs)
+        self.ln_f = _NormLayer(cfg.d_model, rngs=rngs)
+        if not self._use_tied_head:
+            self.head = nnx.Linear(cfg.d_model, cfg.vocab_size, use_bias=False, rngs=rngs)
         self.drop = nnx.Dropout(rate=cfg.dropout_rate, rngs=rngs)
 
     def _get_rope(self, T: int) -> Tuple[Optional[jax.Array], Optional[jax.Array]]:
@@ -105,5 +138,9 @@ class DWALanguageModel(nnx.Module):
         for block in self.blocks_B:
             h = block(h, deterministic=deterministic, rope_cos=rope_cos, rope_sin=rope_sin)
 
-        logits = self.head(self.ln_f(h))
+        ln_f_out = self.ln_f(h)
+        if self._use_tied_head:
+            logits = self.tok_emb.attend(ln_f_out)
+        else:
+            logits = self.head(ln_f_out)
         return logits, alpha, keys, w_norm
