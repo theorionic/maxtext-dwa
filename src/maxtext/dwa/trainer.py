@@ -320,7 +320,10 @@ def _make_train_step(graph, opt_graph, cfg: DWAConfig, lm_cfg: DWATrainConfig):
                 }
                 return total, (metrics, alpha)
 
-            grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+            # Checkpoint loss_fn so model activations (logits, pool assignments,
+            # attention intermediates) are rematerialised during backward instead
+            # of stored — saves ~7-8G of per-device HBM peak on TPU v5 lite.
+            grad_fn = nnx.value_and_grad(jax.checkpoint(loss_fn), has_aux=True)
             (total, (metrics, alpha)), grads = grad_fn(m)
             o.update(m, grads)
 
