@@ -80,7 +80,7 @@ class DWALanguageModel(nnx.Module):
                 cfg.d_model, cfg.n_heads, dropout_rate=cfg.dropout_rate,
                 use_rope=cfg.use_rope, rope_base=cfg.rope_base,
                 num_kv_heads=cfg.num_kv_heads, window_size=cfg.window_size,
-                rngs=rngs,
+                use_flash=cfg.use_flash, rngs=rngs,
             ) for _ in range(cfg.n_layers_A)
         ])
         self.ln_mid = _NormLayer(cfg.d_model, rngs=rngs)
@@ -92,7 +92,7 @@ class DWALanguageModel(nnx.Module):
                 cfg.d_model, cfg.n_heads, dropout_rate=cfg.dropout_rate,
                 use_rope=cfg.use_rope, rope_base=cfg.rope_base,
                 num_kv_heads=cfg.num_kv_heads, window_size=cfg.window_size,
-                rngs=rngs,
+                use_flash=cfg.use_flash, rngs=rngs,
             ) for _ in range(cfg.n_layers_B)
         ])
         self.ln_f = _NormLayer(cfg.d_model, rngs=rngs)

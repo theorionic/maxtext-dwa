@@ -241,7 +241,7 @@ def _apply_rope(q, k, cos, sin):
 
 
 # ---------------------------------------------------------------------------
-# Causal self-attention (GQA + RoPE + sliding window)
+# Causal self-attention (GQA + RoPE + sliding window + flash attention)
 # ---------------------------------------------------------------------------
 
 class CausalSelfAttention(nnx.Module):
@@ -256,6 +256,7 @@ class CausalSelfAttention(nnx.Module):
         rope_base: float = 10000.0,
         num_kv_heads: int = 0,
         window_size: int = 0,
+        use_flash: bool = True,
         rngs: nnx.Rngs = None,  # type: ignore[assignment]
     ) -> None:
         assert d_model % n_heads == 0
@@ -265,6 +266,7 @@ class CausalSelfAttention(nnx.Module):
         self.rope_base = rope_base
         self.num_kv_heads = num_kv_heads if num_kv_heads > 0 else n_heads
         self.window_size = window_size
+        self.use_flash = use_flash
         assert n_heads % self.num_kv_heads == 0
         self.n_rep = n_heads // self.num_kv_heads
 
@@ -273,39 +275,26 @@ class CausalSelfAttention(nnx.Module):
         self.W_out = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
         self.drop = nnx.Dropout(rate=dropout_rate, rngs=rngs)
 
-    def __call__(
-        self,
-        x: jax.Array,
-        deterministic: bool = True,
-        rope_cos: Optional[jax.Array] = None,
-        rope_sin: Optional[jax.Array] = None,
-    ) -> jax.Array:
-        B, T, D = x.shape
+    def _flash_attention(self, q, k, v, deterministic):
+        """Use jax.nn.dot_product_attention (dispatches to flash/fast kernel on TPU/GPU)."""
+        H, num_kv = self.n_heads, self.num_kv_heads
+        if num_kv != H:
+            k = jnp.repeat(k, self.n_rep, axis=1)
+            v = jnp.repeat(v, self.n_rep, axis=1)
+        out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+        return out
+
+    def _manual_attention(self, q, k, v, deterministic):
+        """Fallback einsum-based attention for sliding window or when flash is unavailable."""
         H, dh = self.n_heads, self.d_head
         num_kv = self.num_kv_heads
-
-        q = self.W_q(x).reshape(B, T, H, dh).transpose(0, 2, 1, 3)   # [B, H, T, dh]
-        kv = self.W_kv(x)
-        k, v = jnp.split(kv, 2, axis=-1)
-        k = k.reshape(B, T, num_kv, dh)  # [B, T, num_kv, dh] for RoPE
-        v = v.reshape(B, T, num_kv, dh)
-
-        if self.use_rope and rope_cos is not None and rope_sin is not None:
-            q_for_rope = q.transpose(0, 2, 1, 3)  # [B, T, H, dh]
-            q_for_rope, k = _apply_rope(q_for_rope, k, rope_cos[:, :T], rope_sin[:, :T])
-            q = q_for_rope.transpose(0, 2, 1, 3)
-
-        k = k.transpose(0, 2, 1, 3)  # [B, num_kv, T, dh]
-        v = v.transpose(0, 2, 1, 3)
-
+        T = q.shape[2]
         if num_kv != H:
             k = jnp.repeat(k, self.n_rep, axis=1)
             v = jnp.repeat(v, self.n_rep, axis=1)
 
-        # Scaled dot-product attention
         scores = jnp.einsum("bhtd,bhsd->bhts", q, k) * (dh ** -0.5)
 
-        # Causal + optional sliding window mask
         if self.window_size > 0:
             i = jnp.arange(T)[:, None]
             j = jnp.arange(T)[None, :]
@@ -318,8 +307,39 @@ class CausalSelfAttention(nnx.Module):
         scores = jnp.where(mask[None, None], scores, -1e9)
         attn = jax.nn.softmax(scores, axis=-1)
         attn = self.drop(attn, deterministic=deterministic)
-
         out = jnp.einsum("bhts,bhsd->bhtd", attn, v)
+        return out
+
+    def __call__(
+        self,
+        x: jax.Array,
+        deterministic: bool = True,
+        rope_cos: Optional[jax.Array] = None,
+        rope_sin: Optional[jax.Array] = None,
+    ) -> jax.Array:
+        B, T, D = x.shape
+        dh = self.d_head
+
+        q = self.W_q(x).reshape(B, T, self.n_heads, dh).transpose(0, 2, 1, 3)
+        kv = self.W_kv(x)
+        k, v = jnp.split(kv, 2, axis=-1)
+        k = k.reshape(B, T, self.num_kv_heads, dh)
+        v = v.reshape(B, T, self.num_kv_heads, dh)
+
+        if self.use_rope and rope_cos is not None and rope_sin is not None:
+            q_for_rope = q.transpose(0, 2, 1, 3)
+            q_for_rope, k = _apply_rope(q_for_rope, k, rope_cos[:, :T], rope_sin[:, :T])
+            q = q_for_rope.transpose(0, 2, 1, 3)
+
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        use_flash = self.use_flash and self.window_size == 0
+        if use_flash:
+            out = self._flash_attention(q, k, v, deterministic)
+        else:
+            out = self._manual_attention(q, k, v, deterministic)
+
         out = out.transpose(0, 2, 1, 3).reshape(B, T, D)
         return self.W_out(out)
 
@@ -354,6 +374,7 @@ class TransformerBlock(nnx.Module):
         rope_base: float = 10000.0,
         num_kv_heads: int = 0,
         window_size: int = 0,
+        use_flash: bool = True,
         rngs: nnx.Rngs = None,  # type: ignore[assignment]
     ) -> None:
         self.ln1 = (MaxTextRMSNorm if _HAS_MAXTEXT_RMSNORM else nnx.LayerNorm)(d_model, rngs=rngs)
@@ -364,6 +385,7 @@ class TransformerBlock(nnx.Module):
             rope_base=rope_base,
             num_kv_heads=num_kv_heads,
             window_size=window_size,
+            use_flash=use_flash,
             rngs=rngs,
         )
         self.ln2 = (MaxTextRMSNorm if _HAS_MAXTEXT_RMSNORM else nnx.LayerNorm)(d_model, rngs=rngs)

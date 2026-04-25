@@ -85,6 +85,8 @@ class DWATrainConfig:
     num_kv_heads: int = 0       # 0 = full MHA
     # Window attention
     window_size: int = 0        # 0 = full causal
+    # Flash attention
+    use_flash: bool = True      # Use jax.nn.dot_product_attention on TPU/GPU
     # DWA pool
     N: int = 256
     D: int = 4096

@@ -23,6 +23,7 @@ use_rope: true
 rope_base: 10000.0
 num_kv_heads: 4
 window_size: 0
+use_flash: true
 gamma_init: 0.01
 tau_init: 0.0
 T_temperature: 1.0
