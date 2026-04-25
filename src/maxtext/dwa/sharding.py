@@ -109,6 +109,13 @@ def shard_chunk(xs: np.ndarray, ys: np.ndarray) -> tuple[jax.Array, jax.Array]:
     if _mesh is None:
         setup_mesh()
     data_axis = _mesh.axis_names[0]
+    n_data = _mesh.shape[data_axis]
+    batch_dim = xs.shape[1]
+    if batch_dim % n_data != 0:
+        raise ValueError(
+            f"batch_size={batch_dim} must be divisible by the number of data-parallel devices "
+            f"({n_data}). Set batch_size to a multiple of {n_data} in your config."
+        )
     chunk_sharding = js.NamedSharding(_mesh, js.PartitionSpec(None, data_axis, None))
     return jax.device_put(xs, chunk_sharding), jax.device_put(ys, chunk_sharding)
 
