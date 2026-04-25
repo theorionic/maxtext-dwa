@@ -1,0 +1,71 @@
+# DWA small config — test / demo (fits single TPU chip)
+vocab_size: 50257
+d_model: 256
+n_heads: 8
+n_layers_A: 4
+n_layers_B: 4
+seq_len: 256
+N: 512
+D: 4096
+r: 4
+S: 2
+d_k: 64
+k_max: 16
+batch_size: 16
+lr: 0.0003
+weight_decay: 0.1
+warmup_steps: 200
+max_steps: 5000
+lr_scheduler: cosine
+lr_min_ratio: 0.1
+dropout_rate: 0.1
+use_rope: true
+rope_base: 10000.0
+num_kv_heads: 0
+window_size: 0
+gamma_init: 0.01
+tau_init: 0.0
+T_temperature: 1.0
+lambda_sharp_init: 0.1
+lambda_sharp_phase2_end: 5.0
+lambda_sharp_final: 10.0
+lambda_util: 0.01
+lambda_div: 0.01
+lambda_norm: 0.001
+lambda_sparse: 0.01
+lambda_entropy: 0.01
+aux_warmup_steps: 100
+soft_top_k: true
+soft_top_k_temp: 1.0
+retrieval_norm: true
+retrieval_norm_scale: 0.5
+sigma_anneal: true
+sigma_anneal_start: 2.0
+sigma_anneal_end: 0.5
+sigma_anneal_warmup: 200
+beta_util: 0.1
+ema_decay: 0.99
+phase1_end: 1000
+phase2_end: 5000
+grad_clip: 1.0
+eval_every: 500
+log_every: 100
+eval_steps: 50
+train_steps: 16
+pool_optimizer: "sparse_adam"
+pool_lr: 0.0003
+pool_beta1: 0.9
+pool_beta2: 0.999
+pool_eps: 1.0e-8
+tokenizer_name: "gpt2"
+generate_every: 500
+generate_length: 50
+generate_prompts:
+  - "Once upon a time"
+  - "The king was very"
+datasets:
+  - name: "roneneldan/TinyStories"
+    weight: 1.0
+  - name: "Salesforce/wikitext"
+    subset: "wikitext-2-raw-v1"
+    weight: 0.5
