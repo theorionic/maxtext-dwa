@@ -147,3 +147,18 @@ def to_bf16(model: nnx.Module) -> nnx.Module:
 
 def is_main_process() -> bool:
     return GLOBAL_RANK == 0
+
+
+def setup_from_maxtext(config, mesh):
+    """Initialize global sharding state from MaxText config and mesh."""
+    global _mesh, _data_sharding, _replicated, N_DEVICES, GLOBAL_RANK
+    _mesh = mesh
+    N_DEVICES = jax.device_count()
+    GLOBAL_RANK = jax.process_index()
+    _replicated = js.NamedSharding(mesh, js.PartitionSpec())
+    data_axis = mesh.axis_names[0] if len(mesh.axis_names) > 0 else None
+    if data_axis:
+        _data_sharding = js.NamedSharding(mesh, js.PartitionSpec(data_axis, None))
+    else:
+        _data_sharding = _replicated
+    return _mesh

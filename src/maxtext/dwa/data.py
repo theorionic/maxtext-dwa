@@ -168,3 +168,38 @@ class DataPrefetcher:
         self._stop_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
+
+
+def get_maxtext_tokenizer(config):
+    from maxtext.input_pipeline.tokenizer import build_tokenizer
+    return build_tokenizer(
+        config.tokenizer_path,
+        config.tokenizer_type,
+        config.add_bos,
+        config.add_eos,
+        getattr(config, "hf_access_token", ""),
+    )
+
+
+class MaxTextDataIterator:
+    def __init__(self, config, mesh):
+        from maxtext.input_pipeline.input_pipeline_interface import create_data_iterator
+        from maxtext.common.data_loader import DataLoader
+        self.train_iterator, self.eval_iterator = create_data_iterator(config, mesh)
+        self.train_loader = DataLoader(config, mesh, self.train_iterator, None)
+        self.config = config
+        self.mesh = mesh
+
+    def __iter__(self):
+        while True:
+            batch = self.train_loader.load_next_batch()
+            yield batch["inputs"], batch["targets"]
+
+    def get_eval_batches(self, num_steps=50):
+        from maxtext.common.data_loader import DataLoader
+        eval_loader = DataLoader(self.config, self.mesh, self.eval_iterator, None)
+        batches = []
+        for _ in range(num_steps):
+            batch = eval_loader.load_next_batch()
+            batches.append((batch["inputs"], batch["targets"]))
+        return batches

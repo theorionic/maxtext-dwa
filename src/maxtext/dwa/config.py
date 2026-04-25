@@ -183,6 +183,94 @@ class DWATrainConfig:
             phase1_end=self.phase1_end, phase2_end=self.phase2_end,
         )
 
+    @classmethod
+    def from_maxtext_config(cls, config) -> "DWATrainConfig":
+        """Create a DWATrainConfig from a MaxText HyperParameters config object.
+
+        Maps MaxText config fields to DWA fields where applicable.
+        DWA-specific fields (pool, retrieval, schedule) use DWA defaults.
+        """
+        kwargs = {}
+        # Direct mappings from MaxText config
+        if hasattr(config, "vocab_size"):
+            kwargs["vocab_size"] = config.vocab_size
+        if hasattr(config, "base_emb_dim"):
+            kwargs["d_model"] = config.base_emb_dim
+        if hasattr(config, "base_num_query_heads"):
+            kwargs["n_heads"] = config.base_num_query_heads
+        if hasattr(config, "max_target_length"):
+            kwargs["seq_len"] = config.max_target_length
+        if hasattr(config, "base_num_decoder_layers"):
+            n_layers = config.base_num_decoder_layers
+            if hasattr(config, "dwa_n_layers_a"):
+                kwargs["n_layers_A"] = config.dwa_n_layers_a
+            else:
+                kwargs["n_layers_A"] = max(1, n_layers // 2)
+            if hasattr(config, "dwa_n_layers_b"):
+                kwargs["n_layers_B"] = config.dwa_n_layers_b
+            else:
+                kwargs["n_layers_B"] = max(1, n_layers // 2)
+        if hasattr(config, "dropout_rate"):
+            kwargs["dropout_rate"] = config.dropout_rate
+        
+        # DWA-specific fields (optional overrides from MaxText config)
+        dwa_fields = [
+            "dwa_N", "dwa_D", "dwa_r", "dwa_S", "dwa_d_k", "dwa_k_max",
+            "dwa_gamma_init", "dwa_tau_init", "dwa_T_temperature",
+            "dwa_lambda_sharp_init", "dwa_lambda_sharp_phase2_end", "dwa_lambda_sharp_final",
+            "dwa_lambda_util", "dwa_lambda_div", "dwa_lambda_norm",
+            "dwa_lambda_sparse", "dwa_lambda_entropy", "dwa_aux_warmup_steps",
+            "dwa_soft_top_k", "dwa_soft_top_k_temp",
+            "dwa_retrieval_norm", "dwa_retrieval_norm_scale",
+            "dwa_sigma_anneal", "dwa_sigma_anneal_start", "dwa_sigma_anneal_end", "dwa_sigma_anneal_warmup",
+            "dwa_beta_util", "dwa_ema_decay",
+            "dwa_phase1_end", "dwa_phase2_end",
+        ]
+        field_map = {
+            "dwa_N": "N", "dwa_D": "D", "dwa_r": "r", "dwa_S": "S",
+            "dwa_d_k": "d_k", "dwa_k_max": "k_max", "dwa_gamma_init": "gamma_init",
+            "dwa_tau_init": "tau_init", "dwa_T_temperature": "T_temperature",
+            "dwa_lambda_sharp_init": "lambda_sharp_init",
+            "dwa_lambda_sharp_phase2_end": "lambda_sharp_phase2_end",
+            "dwa_lambda_sharp_final": "lambda_sharp_final",
+            "dwa_lambda_util": "lambda_util", "dwa_lambda_div": "lambda_div",
+            "dwa_lambda_norm": "lambda_norm", "dwa_lambda_sparse": "lambda_sparse",
+            "dwa_lambda_entropy": "lambda_entropy",
+            "dwa_aux_warmup_steps": "aux_warmup_steps",
+            "dwa_soft_top_k": "soft_top_k", "dwa_soft_top_k_temp": "soft_top_k_temp",
+            "dwa_retrieval_norm": "retrieval_norm", "dwa_retrieval_norm_scale": "retrieval_norm_scale",
+            "dwa_sigma_anneal": "sigma_anneal", "dwa_sigma_anneal_start": "sigma_anneal_start",
+            "dwa_sigma_anneal_end": "sigma_anneal_end", "dwa_sigma_anneal_warmup": "sigma_anneal_warmup",
+            "dwa_beta_util": "beta_util", "dwa_ema_decay": "ema_decay",
+            "dwa_phase1_end": "phase1_end", "dwa_phase2_end": "phase2_end",
+        }
+        for mt_field, dwa_field in field_map.items():
+            if hasattr(config, mt_field):
+                kwargs[dwa_field] = getattr(config, mt_field)
+
+        # Training hyperparameters from MaxText config
+        if hasattr(config, "global_batch_size_to_train_on"):
+            kwargs["batch_size"] = config.global_batch_size_to_train_on
+        if hasattr(config, "learning_rate"):
+            kwargs["lr"] = config.learning_rate
+        if hasattr(config, "adam_weight_decay"):
+            kwargs["weight_decay"] = config.adam_weight_decay
+        if hasattr(config, "learning_rate_schedule"):
+            kwargs["lr_scheduler"] = config.learning_rate_schedule
+        if hasattr(config, "gradient_clipping_threshold"):
+            kwargs["grad_clip"] = config.gradient_clipping_threshold
+        if hasattr(config, "steps"):
+            kwargs["max_steps"] = config.steps
+
+        # GQA / attention config
+        if hasattr(config, "base_num_kv_heads"):
+            kwargs["num_kv_heads"] = config.base_num_kv_heads
+        if hasattr(config, "sliding_window_size") and hasattr(config, "attention_type"):
+            if getattr(config, "attention_type", None) and config.attention_type.value == "local_sliding":
+                kwargs["window_size"] = config.sliding_window_size
+
+        return cls(**kwargs)
+
     def count_params(self) -> dict:
         """Count parameters for every component."""
         d = self.d_model
